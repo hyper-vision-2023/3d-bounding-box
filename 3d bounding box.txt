@@ -1,0 +1,205 @@
+import os
+import open3d as o3d
+import json
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, Dataset
+from torch.cuda.amp import autocast, GradScaler
+
+# PointNet++ 모델 정의
+class PointNetPlusPlus(nn.Module):
+    def __init__(self, num_classes):
+        super(PointNetPlusPlus, self).__init__()
+        self.conv1 = nn.Conv1d(3, 64, 1)
+        self.conv2 = nn.Conv1d(64, 128, 1)
+        self.fc1 = nn.Linear(128, 128)
+        self.fc2 = nn.Linear(128, num_classes)  # num_classes는 예측할 바운딩 박스 정보의 차원
+        
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.conv2(x)
+        x = torch.max(x, dim=2)[0]
+        x = self.fc1(x)
+        x = self.fc2(x)
+        return x
+
+# 데이터셋 클래스 정의
+class CustomDataset(Dataset):
+    def __init__(self, data_points, bounding_boxes):
+        self.data_points = data_points
+        self.bounding_boxes = bounding_boxes
+
+    def __len__(self):
+        return len(self.data_points)
+
+    def __getitem__(self, idx):
+        return self.data_points[idx], self.bounding_boxes[idx]
+
+# PCD 파일과 JSON 파일이 저장된 폴더 경로 설정
+train_folder = "/content/drive/MyDrive/learninghat/train_folder"
+
+# PointNet++ 모델 학습 설정
+epochs = 10
+batch_size = 32
+num_classes = 9
+
+# PointNet++ 모델 및 옵티마이저 설정
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = PointNetPlusPlus(num_classes).to(device)
+optimizer = optim.Adam(model.parameters(), lr=0.001)
+criterion = nn.MSELoss()
+
+# 데이터 준비 및 변환
+train_data_points = []
+train_bounding_boxes = []
+validation_data_points = []
+validation_bounding_boxes = []
+
+for pcd_filename in os.listdir(train_folder):
+    if pcd_filename.endswith(".pcd"):
+        pcd_file_path = os.path.join(train_folder, pcd_filename)
+        point_cloud = o3d.io.read_point_cloud(pcd_file_path)
+        points = np.asarray(point_cloud.points)
+        normalized_points = (points - np.mean(points, axis=0)) / np.std(points, axis=0)
+        train_data_points.append(normalized_points)
+        
+        json_filename = pcd_filename.replace(".pcd", ".json")
+        json_file_path = os.path.join(train_folder, json_filename)
+        with open(json_file_path, 'r', encoding='UTF8') as json_file:
+            json_data = json.load(json_file)
+            
+            if 'Annotation' in json_data and len(json_data['Annotation']) > 0:
+                position = json_data['Annotation'][0]['position']
+                dimensions = json_data['Annotation'][0]['scale']
+                rotation = json_data['Annotation'][0]['rotation']
+                train_bounding_boxes.append([position['x'], position['y'], position['z'], dimensions['x'], dimensions['y'], dimensions['z'], rotation['x'], rotation['y'], rotation['z']])
+            else :      continue
+
+# 데이터셋 및 데이터 로더 설정
+train_dataset = CustomDataset(train_data_points, train_bounding_boxes)
+train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+
+validation_dataset = CustomDataset(validation_data_points, validation_bounding_boxes)
+validation_dataloader = DataLoader(validation_dataset, batch_size=batch_size, shuffle=False)
+
+# 자동 혼합 정규화 사용
+scaler = GradScaler()
+
+# 학습 과정
+for epoch in range(epochs):
+    model.train()
+    total_loss = 0.0
+    for batch_idx, (points, bboxes) in enumerate(train_dataloader):
+        points = torch.tensor(points, dtype=torch.float32).to(device)
+        bboxes = torch.tensor(bboxes, dtype=torch.float32).to(device)
+        
+        optimizer.zero_grad()
+        
+        with autocast():
+            outputs = model(points.permute(0, 2, 1))
+            loss = criterion(outputs, bboxes)
+        
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+        
+        total_loss += loss.item()
+
+    model.eval()
+    validation_loss = 0.0
+    with torch.no_grad():
+        for batch_idx, (val_points, val_bboxes) in enumerate(validation_dataloader):
+            val_points = torch.tensor(val_points, dtype=torch.float32).to(device)
+            val_bboxes = torch.tensor(val_bboxes, dtype=torch.float32).to(device)
+
+            with autocast():
+                val_outputs = model(val_points.permute(0, 2, 1))
+                val_loss = criterion(val_outputs, val_bboxes)
+
+            validation_loss += val_loss.item()
+
+    print(f"Epoch [{epoch+1}/{epochs}] - Train Loss: {total_loss/len(train_dataloader)}")
+# 학습된 모델 저장
+torch.save(model.state_dict(), "/content/drive/MyDrive/learninghat/model.pth")
+
+test_data_points = []
+test_bounding_boxes = []
+
+test_folder = "/content/drive/MyDrive/learninghat/modeltest"  # 테스트 데이터 폴더 경로
+
+for pcd_filename in os.listdir(test_folder):
+    if pcd_filename.endswith(".pcd"):
+        pcd_file_path = os.path.join(test_folder, pcd_filename)
+        point_cloud = o3d.io.read_point_cloud(pcd_file_path)
+        points = np.asarray(point_cloud.points)
+        normalized_points = (points - np.mean(points, axis=0)) / np.std(points, axis=0)
+        test_data_points.append(normalized_points)
+        
+        json_filename = pcd_filename.replace(".pcd", ".json")
+        json_file_path = os.path.join(test_folder, json_filename)
+        with open(json_file_path, 'r', encoding='UTF8') as json_file:
+            json_data = json.load(json_file)
+            
+            if 'Annotation' in json_data and len(json_data['Annotation']) > 0:
+                position = json_data['Annotation'][0]['position']
+                dimensions = json_data['Annotation'][0]['scale']
+                rotation = json_data['Annotation'][0]['rotation']
+                test_bounding_boxes.append([position['x'], position['y'], position['z'], dimensions['x'], dimensions['y'], dimensions['z'], rotation['x'], rotation['y'], rotation['z']])
+            else:
+                continue
+
+# 데이터셋 및 데이터 로더 설정
+test_dataset = CustomDataset(test_data_points, test_bounding_boxes)
+test_dataloader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+
+# 테스트 과정
+model.eval()
+test_loss = 0.0
+with torch.no_grad():
+    for batch_idx, (test_points, test_bboxes) in enumerate(test_dataloader):
+        test_points = torch.tensor(test_points, dtype=torch.float32).to(device)
+        test_bboxes = torch.tensor(test_bboxes, dtype=torch.float32).to(device)
+
+        with autocast():
+            test_outputs = model(test_points.permute(0, 2, 1))
+            loss = criterion(test_outputs, test_bboxes)
+
+        test_loss += loss.item()
+
+print(f"Test Loss: {test_loss/len(test_dataloader)}")
+
+model.eval()
+test_loss = 0.0
+with torch.no_grad():
+    for batch_idx, (test_points, test_bboxes) in enumerate(test_dataloader):
+        test_points = torch.tensor(test_points, dtype=torch.float32).to(device)
+        test_bboxes = torch.tensor(test_bboxes, dtype=torch.float32).to(device)
+
+        with autocast():
+            test_outputs = model(test_points.permute(0, 2, 1))
+            loss = criterion(test_outputs, test_bboxes)
+
+        test_loss += loss.item()
+
+    print(f"Test Loss: {test_loss/len(test_dataloader)}")
+
+# 예측한 바운딩 박스 시각화
+fig = plt.figure()
+ax = fig.add_subplot(111, projection='3d')
+
+for batch_idx, (test_points, test_bboxes) in enumerate(test_dataloader):
+    test_points = torch.tensor(test_points, dtype=torch.float32).to(device)
+    test_bboxes = torch.tensor(test_bboxes, dtype=torch.float32).to(device)
+
+    with autocast():
+        test_outputs = model(test_points.permute(0, 2, 1))
+
+    # 예측 바운딩 박스 시각화
+    for i in range(len(test_outputs)):
+        pred_bbox = test_outputs[i].detach().cpu().numpy()
+        ax.scatter(pred_bbox[0], pred_bbox[1], pred_bbox[2], c='r', marker='o')  # 중심점
+        ax.scatter(pred_bbox[0], pred_bbox[1], pred_bbox[5], c='r', marker='o')  # 꼭지점
+
+plt.show()
